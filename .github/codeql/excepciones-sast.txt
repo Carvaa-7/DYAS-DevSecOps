@@ -1,0 +1,6 @@
+# Hallazgos de CodeQL que ya están tratados y que el quality gate de SAST (scripts/umbral-sast.sh) no cuenta.
+# Cada línea debe tener su registro en docs/seguridad.md como "falso positivo" o "riesgo aceptado".
+# Una línea sin registro cuenta como un control desactivado.
+#
+# Formato: <regla> <archivo>    # <hallazgo en docs/seguridad.md>
+java/spring-disabled-csrf-protection src/main/java/edu/unisabana/dyas/reservas/configuracion/SeguridadConfig.java    # H-01 (riesgo aceptado)

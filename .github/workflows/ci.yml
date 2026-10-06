@@ -1,0 +1,176 @@
+name: CI
+
+# Integración continua: construcción, pruebas, reglas de arquitectura y los cuatro controles de seguridad.
+# Cada job es un quality gate: si falla, el pipeline queda en rojo y el Pull Request no se puede fusionar.
+#
+# Cuándo corre:
+#   - en cada push a cualquier rama distinta de main y en cada Pull Request hacia main;
+#   - en main lo ejecuta cd.yml como primera etapa (workflow_call), antes de publicar y desplegar;
+#   - a mano desde la pestaña Actions (workflow_dispatch).
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+# Mínimo privilegio: por defecto los jobs solo pueden leer el código.
+permissions:
+  contents: read
+
+# Los controles de seguridad se ejecutan con los scripts de scripts/, los mismos que se pueden correr a mano.
+# Las versiones de Trivy y Gitleaks están fijas dentro de esos scripts.
+
+jobs:
+  build-pruebas:
+    name: Build, pruebas, cobertura y arquitectura
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Instalar Java 21 (con caché de dependencias Maven)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Construcción
+        run: mvn -B -ntp compile
+
+      # Funciones de aptitud: las reglas de la arquitectura hexagonal (ArquitecturaTest, ArchUnit).
+      - name: Reglas de arquitectura
+        run: mvn -B -ntp test -Dtest=ArquitecturaTest -Dsurefire.failIfNoSpecifiedTests=false
+
+      # verify = pruebas unitarias (surefire) + pruebas de integración con PostgreSQL en Testcontainers (failsafe)
+      #        + reporte de JaCoCo + umbral de cobertura del dominio.
+      - name: Pruebas unitarias, de integración y cobertura del dominio
+        run: mvn -B -ntp verify
+
+      - name: Resumen de cobertura del dominio
+        if: always()
+        run: |
+          if [ -f target/site/jacoco/jacoco.csv ]; then
+            awk -F, 'NR>1 && $2 ~ /dominio/ {f+=$8; c+=$9} END {if (f+c > 0) printf "### Cobertura de líneas del dominio: %.1f %%\n", 100*c/(f+c)}' \
+              target/site/jacoco/jacoco.csv >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publicar reportes de pruebas y cobertura
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reportes-pruebas
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+            target/site/jacoco/
+          if-no-files-found: ignore
+
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # subir los resultados a la pestaña Security > Code scanning
+      actions: read
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      # build-mode none: CodeQL analiza el código Java sin compilarlo.
+      - name: Iniciar CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: none
+
+      - name: Analizar con CodeQL
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:java-kotlin
+          output: reportes/codeql
+
+      # CodeQL publica los hallazgos pero no detiene el pipeline: este paso aplica el umbral.
+      - name: Quality gate de SAST (ningún hallazgo alto o crítico sin tratar)
+        run: scripts/umbral-sast.sh reportes/codeql/*.sarif
+
+      - name: Publicar reporte de CodeQL
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-sast
+          path: reportes/codeql/
+          if-no-files-found: ignore
+
+  sca:
+    name: SCA (dependencias con Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Instalar Java 21 (con caché de dependencias Maven)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Quality gate de SCA (ninguna vulnerabilidad alta o crítica con corrección)
+        run: scripts/sca.sh
+
+      - name: Publicar reporte de dependencias
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-sca
+          path: reportes/trivy-dependencias.json
+          if-no-files-found: ignore
+
+  secretos:
+    name: Secretos (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 descarga todo el historial: Gitleaks revisa cada commit, no solo los archivos actuales.
+      - name: Descargar el código con todo el historial
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Quality gate de secretos (cero secretos, incluido el historial)
+        run: scripts/secretos.sh
+
+      - name: Publicar reporte de secretos
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-secretos
+          path: reportes/gitleaks.json
+          if-no-files-found: ignore
+
+  imagen:
+    name: Imagen Docker y escaneo (Trivy)
+    needs: build-pruebas
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Validar docker-compose.yml
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: Construir la imagen
+        run: docker build --build-arg VERSION="ci-${GITHUB_SHA::7}" -t reservas:ci .
+
+      - name: Quality gate de la imagen (ninguna vulnerabilidad crítica con corrección)
+        run: scripts/escaneo-imagen.sh reservas:ci
+
+      - name: Publicar reporte de la imagen
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-imagen
+          path: reportes/trivy-imagen.json
+          if-no-files-found: ignore

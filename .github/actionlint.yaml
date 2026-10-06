@@ -1,0 +1,5 @@
+# Configuración de actionlint (validador de workflows de GitHub Actions).
+# Declara la etiqueta propia del runner autohospedado que usa cd.yml.
+self-hosted-runner:
+  labels:
+    - dyas

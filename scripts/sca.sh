@@ -9,6 +9,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TRIVY_IMAGEN="${TRIVY_IMAGEN:-aquasec/trivy:0.75.0}"
+
+# Trivy lee el pom.xml y resuelve las dependencias transitivas. Se le pasa la caché local de Maven
+# para que no tenga que descargar los pom de Maven Central (que limita las peticiones repetidas).
+echo "==> Descargando las dependencias a la caché local de Maven"
+mvn -B -q -ntp dependency:go-offline
+
 RAIZ="$(pwd)"
 M2="$HOME/.m2"
 # En Git Bash (Windows), Docker necesita rutas con el formato D:/... y sin conversión automática.
@@ -18,11 +24,6 @@ if pwd -W > /dev/null 2>&1; then
   M2="$(cd ~ && pwd -W)/.m2"
 fi
 mkdir -p reportes
-
-# Trivy lee el pom.xml y resuelve las dependencias transitivas. Se le pasa la caché local de Maven
-# para que no tenga que descargar los pom de Maven Central (que limita las peticiones repetidas).
-echo "==> Descargando las dependencias a la caché local de Maven"
-mvn -B -q -ntp dependency:go-offline
 
 trivy() {
   docker run --rm -v "$RAIZ:/src" -v "$M2:/root/.m2:ro" -v trivy-cache:/root/.cache \

@@ -1,0 +1,216 @@
+name: CD
+
+# Despliegue continuo. Cada cambio que llega a main (o cada tag de versión vX.Y.Z):
+#   1. vuelve a pasar todo el pipeline de CI (ci.yml),
+#   2. construye la imagen, la escanea y la publica en GHCR con la versión y el SHA del commit,
+#   3. la despliega con Docker Compose en el servidor del equipo (runner autohospedado),
+#   4. ejecuta la prueba de humo y la prueba de carga del SLO; si alguna falla, revierte a la versión anterior.
+# La reversión manual se lanza desde la pestaña Actions (workflow_dispatch) indicando el tag de la imagen.
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag de la imagen a la que se quiere volver (por ejemplo sha-1a2b3c4 o 1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Un solo despliegue a la vez; uno nuevo espera a que termine el anterior en lugar de cancelarlo.
+concurrency:
+  group: despliegue-produccion
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  publicar:
+    name: Publicar la imagen en GHCR
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # único job con permiso para escribir en el registro
+    outputs:
+      imagen: ${{ steps.etiquetas.outputs.imagen }}
+      tag-sha: ${{ steps.etiquetas.outputs.tag-sha }}
+      version-completa: ${{ steps.etiquetas.outputs.version-completa }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Instalar Java 21 (para leer la versión del pom.xml)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # La imagen lleva dos etiquetas: la versión (1.0.0) y el SHA del commit (sha-1a2b3c4). Nunca solo latest.
+      # El tag sha-... es inmutable y es el que se despliega.
+      - name: Calcular las etiquetas de la imagen
+        id: etiquetas
+        run: |
+          IMAGEN="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHA_CORTO="${GITHUB_SHA::7}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(mvn -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)"
+          fi
+          {
+            echo "imagen=$IMAGEN"
+            echo "version=$VERSION"
+            echo "tag-sha=sha-$SHA_CORTO"
+            echo "version-completa=$VERSION+sha.$SHA_CORTO"
+          } >> "$GITHUB_OUTPUT"
+          echo "Imagen: $IMAGEN:$VERSION y $IMAGEN:sha-$SHA_CORTO" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Construir la imagen
+        env:
+          IMAGEN: ${{ steps.etiquetas.outputs.imagen }}
+          VERSION: ${{ steps.etiquetas.outputs.version }}
+          TAG_SHA: ${{ steps.etiquetas.outputs.tag-sha }}
+          VERSION_COMPLETA: ${{ steps.etiquetas.outputs.version-completa }}
+        run: |
+          docker build \
+            --build-arg VERSION="$VERSION_COMPLETA" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.version="$VERSION" \
+            -t "$IMAGEN:$VERSION" -t "$IMAGEN:$TAG_SHA" .
+
+      # Se escanea exactamente la imagen que se va a publicar.
+      - name: Quality gate de la imagen
+        run: scripts/escaneo-imagen.sh "${{ steps.etiquetas.outputs.imagen }}:${{ steps.etiquetas.outputs.tag-sha }}"
+
+      - name: Iniciar sesión en GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publicar la imagen
+        env:
+          IMAGEN: ${{ steps.etiquetas.outputs.imagen }}
+          VERSION: ${{ steps.etiquetas.outputs.version }}
+          TAG_SHA: ${{ steps.etiquetas.outputs.tag-sha }}
+        run: |
+          docker push "$IMAGEN:$TAG_SHA"
+          docker push "$IMAGEN:$VERSION"
+
+      - name: Cerrar sesión en GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  desplegar:
+    name: Desplegar y verificar
+    needs: publicar
+    # Runner autohospedado registrado en la máquina del equipo con la etiqueta "dyas".
+    runs-on: [self-hosted, linux, dyas]
+    environment:
+      name: produccion
+      url: ${{ vars.APP_URL }}
+    permissions:
+      contents: read
+      packages: read   # descargar la imagen de GHCR
+    # Valores del environment "produccion": secretos en Secrets, valores no sensibles en Variables.
+    env:
+      POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+      POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      GESTOR_USUARIO: ${{ vars.GESTOR_USUARIO }}
+      GESTOR_CLAVE: ${{ secrets.GESTOR_CLAVE }}
+      CONSULTA_USUARIO: ${{ vars.CONSULTA_USUARIO }}
+      CONSULTA_CLAVE: ${{ secrets.CONSULTA_CLAVE }}
+      BASE_URL: http://localhost:8090
+    steps:
+      - name: Descargar el código (docker-compose.yml, scripts y perf/)
+        uses: actions/checkout@v7
+
+      - name: Iniciar sesión en GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Desplegar con Docker Compose
+        id: desplegar
+        run: scripts/deploy.sh "${{ needs.publicar.outputs.imagen }}:${{ needs.publicar.outputs.tag-sha }}"
+
+      - name: Prueba de humo
+        run: scripts/smoke-test.sh "${{ needs.publicar.outputs.version-completa }}"
+
+      - name: Prueba de carga del SLO (k6)
+        run: scripts/slo.sh
+
+      - name: Publicar reporte de la prueba de carga
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reporte-slo
+          path: reportes/slo.txt
+          if-no-files-found: ignore
+
+      # Si el despliegue, la prueba de humo o el SLO fallan, se vuelve a la versión anterior.
+      # El pipeline queda en rojo de todas formas: la versión nueva no pasó la verificación.
+      - name: Reversión automática
+        if: failure() && steps.desplegar.outcome != 'skipped'
+        run: scripts/rollback.sh
+
+      - name: Cerrar sesión en GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  revertir:
+    name: Reversión manual
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, dyas]
+    environment:
+      name: produccion
+      url: ${{ vars.APP_URL }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      POSTGRES_DB: ${{ vars.POSTGRES_DB }}
+      POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      GESTOR_USUARIO: ${{ vars.GESTOR_USUARIO }}
+      GESTOR_CLAVE: ${{ secrets.GESTOR_CLAVE }}
+      CONSULTA_USUARIO: ${{ vars.CONSULTA_USUARIO }}
+      CONSULTA_CLAVE: ${{ secrets.CONSULTA_CLAVE }}
+      BASE_URL: http://localhost:8090
+      # El valor del formulario se pasa por variable de entorno, nunca directo dentro del script.
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Validar el tag
+        run: |
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Tag no válido: $TAG" >&2
+            exit 1
+          fi
+
+      - name: Iniciar sesión en GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Volver a desplegar la versión indicada y ejecutar la prueba de humo
+        run: scripts/rollback.sh "ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
+
+      - name: Cerrar sesión en GHCR
+        if: always()
+        run: docker logout ghcr.io

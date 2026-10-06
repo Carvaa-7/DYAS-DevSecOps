@@ -1,0 +1,28 @@
+# Dependabot revisa cada semana si hay versiones nuevas de las dependencias y abre un Pull Request
+# por cada actualización. Esos Pull Requests pasan por el mismo pipeline que cualquier otro cambio.
+# Las alertas de seguridad (Dependabot alerts) se activan aparte, en Settings > Advanced Security.
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      menores-y-parches:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
