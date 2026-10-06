@@ -1,0 +1,15 @@
+# Solo pom.xml y src/ hacen falta para construir la imagen.
+# Excluir .env y .git evita que un secreto o el historial terminen dentro de la imagen.
+.env
+.env.*
+.git/
+.github/
+.idea/
+.vscode/
+target/
+reportes/
+docs/
+perf/
+scripts/
+*.md
+docker-compose.yml
