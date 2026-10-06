@@ -6,6 +6,10 @@ name: CD
 #   3. la despliega con Docker Compose en el servidor del equipo (runner autohospedado),
 #   4. ejecuta la prueba de humo y la prueba de carga del SLO; si alguna falla, revierte a la versión anterior.
 # La reversión manual se lanza desde la pestaña Actions (workflow_dispatch) indicando el tag de la imagen.
+#
+# Los jobs que usan el runner autohospedado solo corren si la variable del repositorio DESPLIEGUE vale "activo"
+# (Settings > Secrets and variables > Actions > Variables). Así, mientras el runner no esté registrado,
+# el pipeline no queda esperando un runner que no existe.
 on:
   push:
     branches: [main]
@@ -116,6 +120,7 @@ jobs:
   desplegar:
     name: Desplegar y verificar
     needs: publicar
+    if: vars.DESPLIEGUE == 'activo'
     # Runner autohospedado registrado en la máquina del equipo con la etiqueta "dyas".
     runs-on: [self-hosted, linux, dyas]
     environment:
@@ -173,7 +178,7 @@ jobs:
 
   revertir:
     name: Reversión manual
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && vars.DESPLIEGUE == 'activo'
     runs-on: [self-hosted, linux, dyas]
     environment:
       name: produccion

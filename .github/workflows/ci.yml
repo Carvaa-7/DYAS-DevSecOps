@@ -91,6 +91,9 @@ jobs:
         with:
           category: /language:java-kotlin
           output: reportes/codeql
+          # En repositorios privados de cuentas personales no está disponible la pestaña Code scanning:
+          # el análisis y el quality gate corren igual, pero el resultado no se sube a GitHub.
+          upload: ${{ github.event.repository.private && 'never' || 'always' }}
 
       # CodeQL publica los hallazgos pero no detiene el pipeline: este paso aplica el umbral.
       - name: Quality gate de SAST (ningún hallazgo alto o crítico sin tratar)

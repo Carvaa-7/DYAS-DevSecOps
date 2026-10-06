@@ -18,6 +18,7 @@ fi
 mkdir -p reportes
 
 # "git" revisa cada commit del historial, no solo los archivos actuales.
-docker run --rm -v "$RAIZ:/repo" "$GITLEAKS_IMAGEN" git /repo \
+# -w /repo hace que Gitleaks lea el archivo .gitleaksignore de la raíz del repositorio, si existe.
+docker run --rm -v "$RAIZ:/repo" -w /repo "$GITLEAKS_IMAGEN" git /repo \
   --redact --verbose --exit-code 1 \
   --report-format json --report-path /repo/reportes/gitleaks.json
