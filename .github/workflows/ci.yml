@@ -170,10 +170,16 @@ jobs:
       - name: Quality gate de la imagen (ninguna vulnerabilidad crítica con corrección)
         run: scripts/escaneo-imagen.sh reservas:ci
 
-      - name: Publicar reporte de la imagen
+      # El SBOM no detiene el pipeline: deja registro de qué componentes quedaron dentro de la imagen.
+      - name: SBOM de la imagen (CycloneDX)
+        run: scripts/sbom.sh reservas:ci
+
+      - name: Publicar reporte y SBOM de la imagen
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: reporte-imagen
-          path: reportes/trivy-imagen.json
+          path: |
+            reportes/trivy-imagen.json
+            reportes/sbom-imagen.cdx.json
           if-no-files-found: ignore

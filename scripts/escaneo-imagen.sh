@@ -11,7 +11,7 @@ set -euo pipefail
 IMAGEN="${1:?Uso: scripts/escaneo-imagen.sh <imagen:tag>}"
 cd "$(dirname "$0")/.."
 
-TRIVY_IMAGEN="${TRIVY_IMAGEN:-aquasec/trivy:0.75.0}"
+TRIVY_IMAGEN="${TRIVY_IMAGEN:-aquasec/trivy:0.76.0}"
 RAIZ="$(pwd)"
 # En Git Bash (Windows), Docker necesita rutas con el formato D:/... y sin conversión automática.
 if pwd -W > /dev/null 2>&1; then

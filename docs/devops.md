@@ -19,10 +19,11 @@ flowchart LR
         build --> img
     end
 
-    ci -->|"solo en main o tag"| pub["publicar<br/>build · Trivy · push a GHCR<br/>(versión + sha)"]
-    pub --> dep["desplegar (runner autohospedado)<br/>deploy.sh · smoke-test.sh · slo.sh"]
+    ci -->|"solo en main o tag"| pub["publicar<br/>build · Trivy · SBOM · push a GHCR<br/>(versión + sha) · firma cosign"]
+    pub --> dep["desplegar (runner autohospedado)<br/>verificar firma · deploy.sh ·<br/>smoke-test.sh · slo.sh"]
     dep -->|"si falla"| rb["rollback.sh<br/>versión anterior"]
-    manual["Actions > CD > Run workflow<br/>(tag)"] --> rev["revertir<br/>rollback.sh &lt;tag&gt;"]
+    manual["Actions > CD > Run workflow<br/>(tag)"] --> rev["revertir<br/>verificar firma · rollback.sh &lt;tag&gt;"]
+    lunes["Cada lunes o<br/>Run workflow"] --> dora["dora.yml<br/>métricas DORA"]
 ```
 
 - En un Pull Request corre solo `ci.yml`. Sus jobs son los *checks* obligatorios del ruleset de `main`.
@@ -41,11 +42,13 @@ flowchart LR
 | Análisis de seguridad: dependencias | `sca` | Trivy `fs` | Hay una vulnerabilidad HIGH o CRITICAL con corrección disponible. | Umbral mínimo del enunciado. Si hay corrección, actualizar es responsabilidad del equipo. |
 | Análisis de seguridad: secretos | `secretos` | Gitleaks | Aparece un secreto en cualquier commit. | Umbral mínimo del enunciado: cero secretos, incluido el historial. |
 | Imagen y escaneo | `imagen` y `publicar` | Docker + Trivy `image` | Hay una vulnerabilidad CRITICAL con corrección disponible. | Umbral mínimo del enunciado. El sistema base tiene vulnerabilidades sin corrección que no dependen del equipo (H-05). |
+| SBOM (no lo exige el enunciado) | `imagen` y `publicar` / *SBOM de la imagen* | Trivy (CycloneDX) | No detiene el pipeline. | Deja registro de cada componente de la imagen publicada, para revisar después si una vulnerabilidad nueva afecta a una versión ya desplegada. |
+| Firma de la imagen (no lo exige el enunciado) | `publicar` / *Firmar la imagen...*; `desplegar` y `revertir` / *Verificar la firma de la imagen* | cosign (Sigstore) + `scripts/verificar-firma.sh` | La imagen no tiene una firma de `cd.yml` de este repositorio desde `main` o desde un tag. | Garantiza que lo que se despliega lo construyó y lo escaneó este pipeline, no alguien con acceso al registro (amenaza A3). |
 | Despliegue | `desplegar` / *Desplegar con Docker Compose* | `scripts/deploy.sh` | El contenedor no llega a *healthy* en 180 s. | Tiempo holgado para que arranque la JVM y se conecte a PostgreSQL. |
 | Verificación: prueba de humo | `desplegar` / *Prueba de humo* | `scripts/smoke-test.sh` | Health no está UP, la versión no es la desplegada, la API no exige autenticación o falla el flujo crear, consultar y cancelar. | Comprueba lo mínimo para decir que la versión nueva funciona. |
 | Verificación: SLO | `desplegar` / *Prueba de carga del SLO* | k6 (`perf/slo.js`) | p95 ≥ **500 ms** o errores ≥ **1 %** con 20 iteraciones por segundo durante 30 s. | Es el SLO del servicio: una consulta de reservas debe sentirse inmediata. La prueba es corta para no alargar el pipeline; la prueba larga se lanza a mano. |
 
-Todos los reportes (pruebas, cobertura, CodeQL, Trivy, Gitleaks y k6) se publican como artefactos de cada ejecución. Las dependencias de Maven quedan en caché (`setup-java` con `cache: maven`), de modo que el pipeline de integración tarde menos de 10 minutos.
+Todos los reportes (pruebas, cobertura, CodeQL, Trivy, SBOM, Gitleaks y k6) se publican como artefactos de cada ejecución. Las dependencias de Maven quedan en caché (`setup-java` con `cache: maven`), de modo que el pipeline de integración tarde menos de 10 minutos.
 
 ## 3. Vista de despliegue
 
@@ -90,7 +93,7 @@ El runner solo abre conexiones salientes hacia GitHub: no hace falta abrir puert
 | `APP_URL` | Variable | URL del sistema desplegado (aparece en la ejecución del pipeline) |
 | `DESPLIEGUE` | Variable **del repositorio** | `activo` para habilitar los jobs del runner autohospedado |
 
-`GITHUB_TOKEN` lo crea GitHub en cada ejecución. Solo el job `publicar` tiene permiso `packages: write`; `desplegar` y `revertir` tienen `packages: read`; el resto solo `contents: read`.
+`GITHUB_TOKEN` lo crea GitHub en cada ejecución. Solo el job `publicar` tiene permiso `packages: write` e `id-token: write` (el segundo, para pedir el certificado de firma); `desplegar` y `revertir` tienen `packages: read`; el resto solo `contents: read`.
 
 ## 5. Reversión
 
@@ -105,3 +108,16 @@ El script `scripts/deploy.sh` guarda en `~/.reservas-despliegue/` qué imagen es
 Los tags anteriores se consultan en la página del paquete en GitHub (*Packages*) o en el resumen de cada ejecución del job `publicar`.
 
 La reversión cambia la imagen, no los datos: el esquema de la base de datos debe ser compatible con la versión anterior (en este servicio, `schema.sql` solo crea tablas e índices si no existen).
+
+## 6. Métricas DORA
+
+El workflow `dora.yml` calcula cada lunes (o a mano, con *Run workflow*) las cuatro métricas de desempeño de entrega del programa DORA a partir del historial de `cd.yml`. Lo hace `scripts/metricas-dora.sh`, que solo lee la API de GitHub.
+
+| Métrica | Qué mide en este repositorio | Qué dice del pipeline |
+|---|---|---|
+| Frecuencia de despliegue | Ejecuciones exitosas del job *Desplegar y verificar* por semana. | Qué tan seguido llega un cambio a producción. |
+| Tiempo de espera de los cambios | Mediana del tiempo entre el último commit de cada push y el fin de su despliegue verificado. | Cuánto tarda un cambio aprobado en estar disponible. Incluye el pipeline completo y la espera del runner. |
+| Tasa de fallos de los cambios | Despliegues fallidos (despliegue, prueba de humo o SLO) sobre el total. | Cuántos cambios pasan la CI pero fallan en producción. |
+| Tiempo de restauración | Mediana del tiempo entre un despliegue fallido y el siguiente exitoso. | Qué tan rápido el equipo vuelve a tener una versión sana desplegada. La reversión automática cuenta como fallo; el arreglo posterior cierra el intervalo. |
+
+Las métricas se leen como tendencia del equipo, no como meta individual: con pocas ejecuciones, un solo despliegue cambia mucho los valores. El resultado queda en el resumen de la ejecución y en el artefacto `metricas-dora`.

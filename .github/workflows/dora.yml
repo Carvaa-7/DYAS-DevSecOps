@@ -1,0 +1,44 @@
+name: Métricas DORA
+
+# Calcula las cuatro métricas DORA (frecuencia de despliegue, tiempo de espera de los cambios,
+# tasa de fallos y tiempo de restauración) a partir del historial de ejecuciones de cd.yml.
+# No despliega ni modifica nada: solo lee el historial de Actions y publica un resumen.
+#
+# Cuándo corre:
+#   - cada lunes a las 7:00 (hora de Colombia, 12:00 UTC);
+#   - a mano desde la pestaña Actions (workflow_dispatch).
+on:
+  schedule:
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+    inputs:
+      ejecuciones:
+        description: 'Cuántas ejecuciones recientes de CD revisar (máximo 100)'
+        required: false
+        default: '50'
+        type: string
+
+permissions:
+  contents: read
+  actions: read   # leer el historial de ejecuciones y de jobs
+
+jobs:
+  dora:
+    name: Calcular las métricas DORA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v7
+
+      - name: Calcular las métricas
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EJECUCIONES: ${{ inputs.ejecuciones || '50' }}
+        run: scripts/metricas-dora.sh >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar el reporte
+        uses: actions/upload-artifact@v7
+        with:
+          name: metricas-dora
+          path: reportes/dora.md
+          if-no-files-found: ignore

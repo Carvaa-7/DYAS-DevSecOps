@@ -2,10 +2,14 @@ name: CD
 
 # Despliegue continuo. Cada cambio que llega a main (o cada tag de versión vX.Y.Z):
 #   1. vuelve a pasar todo el pipeline de CI (ci.yml),
-#   2. construye la imagen, la escanea y la publica en GHCR con la versión y el SHA del commit,
-#   3. la despliega con Docker Compose en el servidor del equipo (runner autohospedado),
+#   2. construye la imagen, la escanea, genera su SBOM, la publica en GHCR con la versión y el SHA del commit
+#      y la firma (firma sin llaves de Sigstore, con la identidad de este workflow),
+#   3. verifica la firma y la despliega con Docker Compose en el servidor del equipo (runner autohospedado),
 #   4. ejecuta la prueba de humo y la prueba de carga del SLO; si alguna falla, revierte a la versión anterior.
 # La reversión manual se lanza desde la pestaña Actions (workflow_dispatch) indicando el tag de la imagen.
+#
+# La firma y su verificación solo se hacen en repositorios públicos: la firma sin llaves queda registrada en
+# Rekor, un registro de transparencia público, y ese registro incluiría el nombre de un repositorio privado.
 #
 # Los jobs que usan el runner autohospedado solo corren si la variable del repositorio DESPLIEGUE vale "activo"
 # (Settings > Secrets and variables > Actions > Variables). Así, mientras el runner no esté registrado,
@@ -46,6 +50,7 @@ jobs:
     permissions:
       contents: read
       packages: write   # único job con permiso para escribir en el registro
+      id-token: write   # token OIDC de GitHub para firmar la imagen sin llaves (Sigstore)
     outputs:
       imagen: ${{ steps.etiquetas.outputs.imagen }}
       tag-sha: ${{ steps.etiquetas.outputs.tag-sha }}
@@ -104,7 +109,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
+      # SBOM de exactamente la imagen que se va a publicar. Se adjunta a la imagen como atestación (más abajo).
+      - name: SBOM de la imagen (CycloneDX)
+        run: scripts/sbom.sh "${{ steps.etiquetas.outputs.imagen }}:${{ steps.etiquetas.outputs.tag-sha }}"
+
       - name: Publicar la imagen
+        id: publicar
         env:
           IMAGEN: ${{ steps.etiquetas.outputs.imagen }}
           VERSION: ${{ steps.etiquetas.outputs.version }}
@@ -112,6 +122,35 @@ jobs:
         run: |
           docker push "$IMAGEN:$TAG_SHA"
           docker push "$IMAGEN:$VERSION"
+          # El digest (sha256:...) identifica el contenido de la imagen. Se firma el digest, no la etiqueta.
+          REF_DIGEST="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGEN:$TAG_SHA" | grep -F "$IMAGEN@" | head -1)"
+          echo "ref-digest=$REF_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Digest publicado: \`$REF_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Instalar cosign
+        if: ${{ !github.event.repository.private }}
+        uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: 'v3.1.3'
+
+      # Firma sin llaves: cosign pide un certificado de corta duración a Sigstore con el token OIDC del job.
+      # El certificado dice qué workflow, de qué repositorio y en qué rama firmó. El job desplegar lo verifica.
+      - name: Firmar la imagen y adjuntar el SBOM como atestación
+        if: ${{ !github.event.repository.private }}
+        env:
+          REF_DIGEST: ${{ steps.publicar.outputs.ref-digest }}
+        run: |
+          cosign sign --yes "$REF_DIGEST"
+          cosign attest --yes --type cyclonedx --predicate reportes/sbom-imagen.cdx.json "$REF_DIGEST"
+          echo "Imagen firmada y SBOM adjunto: \`$REF_DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar el SBOM
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-imagen
+          path: reportes/sbom-imagen.cdx.json
+          if-no-files-found: ignore
 
       - name: Cerrar sesión en GHCR
         if: always()
@@ -148,9 +187,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
+      # Quality gate de la cadena de suministro: solo se despliega una imagen firmada por cd.yml de este
+      # repositorio. Devuelve la referencia fijada por digest (imagen:tag@sha256:...), que es la que se despliega.
+      - name: Verificar la firma de la imagen
+        id: firma
+        env:
+          IMAGEN: ${{ needs.publicar.outputs.imagen }}:${{ needs.publicar.outputs.tag-sha }}
+          PRIVADO: ${{ github.event.repository.private }}
+        run: |
+          if [[ "$PRIVADO" == "true" ]]; then
+            echo "Repositorio privado: la imagen no se firma y no se verifica (H-08 en docs/seguridad.md)." >> "$GITHUB_STEP_SUMMARY"
+            echo "referencia=$IMAGEN" >> "$GITHUB_OUTPUT"
+          else
+            # Se asigna primero a una variable: si la verificación falla, el paso falla (un echo con $(...) no fallaría).
+            REFERENCIA="$(scripts/verificar-firma.sh "$IMAGEN")"
+            echo "referencia=$REFERENCIA" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Desplegar con Docker Compose
         id: desplegar
-        run: scripts/deploy.sh "${{ needs.publicar.outputs.imagen }}:${{ needs.publicar.outputs.tag-sha }}"
+        run: scripts/deploy.sh "${{ steps.firma.outputs.referencia }}"
 
       - name: Prueba de humo
         run: scripts/smoke-test.sh "${{ needs.publicar.outputs.version-completa }}"
@@ -213,8 +269,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
+      # Una reversión también es un despliegue: solo se vuelve a una imagen firmada por cd.yml.
+      - name: Verificar la firma de la imagen
+        id: firma
+        env:
+          PRIVADO: ${{ github.event.repository.private }}
+        run: |
+          IMAGEN="ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
+          if [[ "$PRIVADO" == "true" ]]; then
+            echo "referencia=$IMAGEN" >> "$GITHUB_OUTPUT"
+          else
+            # Se asigna primero a una variable: si la verificación falla, el paso falla (un echo con $(...) no fallaría).
+            REFERENCIA="$(scripts/verificar-firma.sh "$IMAGEN")"
+            echo "referencia=$REFERENCIA" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Volver a desplegar la versión indicada y ejecutar la prueba de humo
-        run: scripts/rollback.sh "ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
+        run: scripts/rollback.sh "${{ steps.firma.outputs.referencia }}"
 
       - name: Cerrar sesión en GHCR
         if: always()

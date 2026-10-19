@@ -1,13 +1,13 @@
 # Taller de DevSecOps y Despliegue Continuo con GitHub Actions
 
-Este taller tiene como objetivo aprender a **incorporar la seguridad y la verificación de la arquitectura dentro del pipeline** y a **desplegar automáticamente cada versión aprobada**, de forma que un cambio solo llegue a producción si compila, pasa las pruebas, respeta la arquitectura, no introduce vulnerabilidades conocidas y cumple el SLO una vez desplegado.
-Cubre las secciones 2 a 5 del enunciado del **Proyecto 3 del curso** (integración continua, arquitectura verificada en el pipeline, DevSecOps y despliegue continuo).
+Este taller tiene como objetivo aprender a **incorporar la seguridad y la verificación de la arquitectura dentro del pipeline** y a **desplegar automáticamente cada versión aprobada**, de forma que un cambio solo llegue a producción si compila, pasa las pruebas, respeta la arquitectura, no introduce vulnerabilidades conocidas, fue construido y firmado por el propio pipeline y cumple el SLO una vez desplegado.
+La correspondencia con el proyecto del curso está en [Cómo usar esta guía para tu proyecto](#cómo-usar-esta-guía-para-tu-proyecto).
 
 ---
 
 ## Objetivo General
 
-Comprender, configurar y aplicar un pipeline de **entrega continua y segura** con **GitHub Actions** sobre un servicio **Java 21 + Spring Boot 4.1** con **arquitectura hexagonal** y **PostgreSQL**, integrando **reglas de arquitectura como pruebas (ArchUnit)**, **cuatro controles de seguridad como quality gates (CodeQL, Trivy y Gitleaks)**, **publicación de imágenes versionadas en GitHub Container Registry**, **despliegue con Docker Compose en un runner autohospedado**, **prueba de humo**, **verificación del SLO con k6** y **reversión a la versión anterior**.
+Comprender, configurar y aplicar un pipeline de **entrega continua y segura** con **GitHub Actions** sobre un servicio **Java 21 + Spring Boot 4.1** con **arquitectura hexagonal** y **PostgreSQL**, integrando **reglas de arquitectura como pruebas (ArchUnit)**, **cuatro controles de seguridad como quality gates (CodeQL, Trivy y Gitleaks)**, **publicación de imágenes versionadas en GitHub Container Registry** con su **SBOM** y su **firma (Sigstore cosign)**, **despliegue con Docker Compose en un runner autohospedado** solo de imágenes firmadas, **prueba de humo**, **verificación del SLO con k6**, **reversión a la versión anterior** y **métricas DORA** calculadas desde el historial del pipeline.
 
 ---
 
@@ -34,7 +34,8 @@ Comprender, configurar y aplicar un pipeline de **entrega continua y segura** co
   - [Paso 10: Configurar el environment y los secretos](#paso-10-configurar-el-environment-y-los-secretos)
   - [Paso 11: Primer despliegue desde GitHub](#paso-11-primer-despliegue-desde-github)
   - [Paso 12: Reversión desde GitHub](#paso-12-reversión-desde-github)
-  - [Paso 13: Apagar el sistema](#paso-13-apagar-el-sistema)
+  - [Paso 13: Medir el desempeño con las métricas DORA](#paso-13-medir-el-desempeño-con-las-métricas-dora)
+  - [Paso 14: Apagar el sistema](#paso-14-apagar-el-sistema)
 - [Demostrar que los controles funcionan](#demostrar-que-los-controles-funcionan)
 - [Retos opcionales](#retos-opcionales)
 - [Buenas prácticas](#buenas-prácticas)
@@ -98,6 +99,25 @@ Prueba corta, justo después de desplegar, que confirma que lo esencial funciona
 - **Reversión (rollback)**
 Volver a desplegar la versión anterior cuando la nueva falla. Con imágenes inmutables basta con desplegar el tag anterior.
 
+- **Cadena de suministro de software**
+Todo lo que interviene entre el código y lo que corre en producción: librerías de terceros, imágenes base, herramientas del pipeline y el registro de imágenes. Un atacante no necesita entrar al código si puede cambiar cualquiera de esos eslabones. Ejemplo: alguien con una credencial filtrada del registro sube una imagen con el mismo tag que la versión buena. El marco SLSA (*Supply-chain Levels for Software Artifacts*) ordena estas prácticas por niveles.
+
+- **SBOM (lista de materiales de software)**
+Inventario de cada componente que quedó dentro de un artefacto, con su versión, en un formato estándar (CycloneDX o SPDX). Sirve para responder en minutos si una vulnerabilidad nueva afecta a una versión ya desplegada, sin reconstruir nada.
+Ejemplo: el día que se publica un CVE de Tomcat, se busca `tomcat-embed-core` en el SBOM de la imagen que está en producción.
+
+- **Firma de imágenes sin llaves (Sigstore cosign)**
+El pipeline firma el *digest* de la imagen (`sha256:...`, el identificador de su contenido) con un certificado de corta duración que Sigstore emite a partir de la identidad del workflow (el token OIDC de GitHub Actions). No hay llave privada que guardar ni que se pueda filtrar. Antes de desplegar, se verifica que la firma la hizo `cd.yml` de **este** repositorio desde `main` o desde un tag de versión.
+
+- **Confianza cero (zero trust)**
+Principio de seguridad: ninguna petición se considera confiable por venir de "adentro" (la red del equipo, el registro propio, un integrante). Cada acceso se autentica y se autoriza con el mínimo privilegio. En este taller: la API autentica cada petición, cada job del pipeline tiene solo los permisos que necesita y el despliegue verifica la firma de la imagen aunque venga del registro del propio equipo.
+
+- **Métricas DORA**
+Cuatro métricas del programa de investigación DORA para medir el desempeño de la entrega de software: **frecuencia de despliegue**, **tiempo de espera de los cambios** (del commit a producción), **tasa de fallos de los cambios** y **tiempo de restauración** tras un fallo. Se calculan con el historial del pipeline, no con encuestas.
+
+- **Instrucciones para agentes de código (`AGENTS.md`)**
+Archivo en la raíz del repositorio que leen los asistentes y agentes de programación antes de proponer cambios: reglas de arquitectura, comandos de verificación y lo que no deben tocar. Es un control **antes** del cambio; las pruebas, ArchUnit y los quality gates son el control **después**. Ninguno de los dos basta solo: un agente puede ignorar las instrucciones, y el pipeline solo detecta lo que alguien escribió como prueba.
+
 ---
 
 ## CONOCE EL TALLER
@@ -148,7 +168,8 @@ El servicio sigue la **arquitectura hexagonal** (puertos y adaptadores), documen
 .
 ├─ .github/
 │   ├─ workflows/ci.yml                 # CI: build, pruebas, ArchUnit, CodeQL, Trivy, Gitleaks, imagen
-│   ├─ workflows/cd.yml                 # CD: CI + publicar en GHCR + desplegar + verificar + revertir
+│   ├─ workflows/cd.yml                 # CD: CI + publicar y firmar en GHCR + verificar firma + desplegar + revertir
+│   ├─ workflows/dora.yml               # métricas DORA desde el historial de cd.yml (cada lunes o a mano)
 │   ├─ dependabot.yml                   # actualizaciones de Maven, Docker y actions
 │   ├─ codeql/excepciones-sast.txt      # hallazgos de CodeQL ya tratados (ver docs/seguridad.md)
 │   └─ actionlint.yaml                  # etiqueta del runner autohospedado para el validador de workflows
@@ -176,16 +197,20 @@ El servicio sigue la **arquitectura hexagonal** (puertos y adaptadores), documen
 │   ├─ sca.sh                           # quality gate de dependencias (Trivy fs)
 │   ├─ escaneo-imagen.sh                # quality gate de la imagen (Trivy image)
 │   ├─ secretos.sh                      # quality gate de secretos (Gitleaks)
-│   └─ umbral-sast.sh                   # quality gate de SAST sobre el reporte de CodeQL
+│   ├─ umbral-sast.sh                   # quality gate de SAST sobre el reporte de CodeQL
+│   ├─ sbom.sh                          # SBOM de la imagen en formato CycloneDX (Trivy)
+│   ├─ verificar-firma.sh               # verifica la firma de la imagen antes de desplegar (cosign)
+│   └─ metricas-dora.sh                 # calcula las métricas DORA con la API de GitHub
 ├─ docs/
 │   ├─ devops.md                        # pipeline, etapas, umbrales, vista de despliegue, reversión
-│   ├─ seguridad.md                     # modelo STRIDE, controles y registro de hallazgos
+│   ├─ seguridad.md                     # modelo STRIDE, inventario de datos, controles y registro de hallazgos
 │   └─ adr/                             # ADR-001 hexagonal, ADR-002 despliegue, ADR-003 seguridad del pipeline
 ├─ Dockerfile                           # multi-etapa, base con versión fija, usuario sin privilegios, HEALTHCHECK
 ├─ .dockerignore
 ├─ docker-compose.yml                   # app + postgres (+ k6 con el perfil "pruebas")
 ├─ .env.example                         # variables necesarias con valores de ejemplo
 ├─ .trivyignore                         # vulnerabilidades tratadas (vacío)
+├─ AGENTS.md                            # instrucciones para asistentes y agentes de código
 └─ pom.xml                              # Spring Boot 4.1.1, Java 21, JaCoCo, ArchUnit, Testcontainers
 ```
 
@@ -204,8 +229,8 @@ flowchart LR
         img["imagen (Trivy image)"]
         build --> img
     end
-    ci -->|"solo main o tag"| pub["publicar en GHCR"]
-    pub --> dep["desplegar en el runner autohospedado<br/>humo + SLO"]
+    ci -->|"solo main o tag"| pub["publicar en GHCR<br/>SBOM + firma"]
+    pub --> dep["desplegar en el runner autohospedado<br/>verificar firma + humo + SLO"]
     dep -->|"si falla"| rb["reversión automática"]
 ```
 
@@ -215,11 +240,12 @@ flowchart LR
 | | **SAST (CodeQL)** | Analiza el código con CodeQL y aplica el umbral con `scripts/umbral-sast.sh`. |
 | | **SCA (dependencias con Trivy)** | `scripts/sca.sh`. |
 | | **Secretos (Gitleaks)** | `scripts/secretos.sh` sobre todo el historial (`fetch-depth: 0`). |
-| | **Imagen Docker y escaneo (Trivy)** | Valida el `docker-compose.yml`, construye la imagen y ejecuta `scripts/escaneo-imagen.sh`. |
+| | **Imagen Docker y escaneo (Trivy)** | Valida el `docker-compose.yml`, construye la imagen, ejecuta `scripts/escaneo-imagen.sh` y genera el SBOM con `scripts/sbom.sh`. |
 | `cd.yml` | **CI** | Llama a `ci.yml` completo (`workflow_call`). |
-| | **Publicar la imagen en GHCR** | Construye, escanea y publica `ghcr.io/<usuario>/<repo>:<versión>` y `:sha-<commit>`. Único job con `packages: write`. |
-| | **Desplegar y verificar** | En el runner autohospedado: `deploy.sh`, `smoke-test.sh`, `slo.sh`; si algo falla, `rollback.sh`. |
-| | **Reversión manual** | Con *Run workflow* y un tag, vuelve a esa versión. |
+| | **Publicar la imagen en GHCR** | Construye, escanea, genera el SBOM y publica `ghcr.io/<usuario>/<repo>:<versión>` y `:sha-<commit>`. Después firma el digest con cosign y le adjunta el SBOM como atestación. Único job con `packages: write` e `id-token: write`. |
+| | **Desplegar y verificar** | En el runner autohospedado: `verificar-firma.sh`, `deploy.sh` (por digest), `smoke-test.sh`, `slo.sh`; si algo falla, `rollback.sh`. |
+| | **Reversión manual** | Con *Run workflow* y un tag: verifica la firma de esa imagen y vuelve a esa versión. |
+| `dora.yml` | **Calcular las métricas DORA** | Cada lunes o con *Run workflow*: `scripts/metricas-dora.sh` sobre el historial de `cd.yml`. Solo lee; no despliega. |
 
 `ci.yml` corre en cada push a una rama distinta de `main` y en cada Pull Request hacia `main`. En `main` lo ejecuta `cd.yml` como primera etapa, para no repetirlo dos veces por cada cambio.
 
@@ -237,6 +263,7 @@ El detalle de cada etapa, la vista de despliegue y el procedimiento de reversió
 | SCA | Hay una dependencia con una vulnerabilidad **HIGH o CRITICAL con corrección** disponible. |
 | Secretos | Hay **un** secreto en cualquier commit. |
 | Imagen | Hay una vulnerabilidad **CRITICAL con corrección** disponible. |
+| Firma de la imagen | La imagen no tiene una firma hecha por `cd.yml` de este repositorio (desde `main` o un tag `vX.Y.Z`): no se despliega. Solo en repositorios públicos (ver H-08 en `docs/seguridad.md`). |
 | Despliegue y verificación | El contenedor no queda sano, falla la prueba de humo, o el **p95 ≥ 500 ms** o los **errores ≥ 1 %** en la prueba de carga. |
 
 > Los umbrales viven en el código del repositorio (`pom.xml`, `perf/slo.js`, `scripts/`), no en la configuración de GitHub:
@@ -495,6 +522,29 @@ Los jobs de seguridad del pipeline llaman a estos mismos scripts. La primera eje
    ==> 1 hallazgo(s) altos o críticos, 0 sin tratar
    ```
 
+5. **SBOM** de la imagen (no es un quality gate):
+
+   ```sh
+   scripts/sbom.sh reservas:local
+   ```
+
+   ```text
+   ==> Generando el SBOM de reservas:local (CycloneDX)
+   ==> SBOM en reportes/sbom-imagen.cdx.json: 223 componentes (85 librerías Java, 136 paquetes del sistema operativo)
+   ```
+
+   Busca en el archivo qué versión de Tomcat quedó dentro de la imagen:
+
+   ```sh
+   grep -o '"purl": *"pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@[^"]*' reportes/sbom-imagen.cdx.json
+   ```
+
+   ```text
+   "purl": "pkg:maven/org.apache.tomcat.embed/tomcat-embed-core@11.0.26
+   ```
+
+   Es la versión que fija el `pom.xml` (hallazgo H-03), no la que trae Spring Boot por defecto. Si mañana se publica una vulnerabilidad de esa versión, el SBOM de cada imagen publicada dice cuáles están afectadas sin volver a construirlas.
+
 ### Paso 6: Desplegar y revertir en local
 
 Antes de configurar GitHub, prueba en tu máquina los scripts que va a usar el pipeline. Construye dos versiones de la imagen:
@@ -665,7 +715,7 @@ El runner se instala en la máquina donde va a quedar desplegado el sistema.
    Desplegar y verificar                            ✓   (en el runner "dyas")
    ```
 
-3. Abre el job **Desplegar y verificar** y revisa los pasos *Desplegar con Docker Compose*, *Prueba de humo* y *Prueba de carga del SLO*. El enlace de `APP_URL` aparece en el resumen de la ejecución y en la página del environment.
+3. Abre el job **Desplegar y verificar** y revisa los pasos *Verificar la firma de la imagen*, *Desplegar con Docker Compose*, *Prueba de humo* y *Prueba de carga del SLO*. El enlace de `APP_URL` aparece en el resumen de la ejecución y en la página del environment. La imagen se despliega por digest: en el log de *Desplegar con Docker Compose* aparece como `ghcr.io/<usuario>/<repo>:sha-<commit>@sha256:...`.
 4. Desde otro equipo de la misma red, comprueba la versión desplegada:
 
    ```sh
@@ -676,7 +726,28 @@ El runner se instala en la máquina donde va a quedar desplegado el sistema.
    {"app":{"version":"1.0.0+sha.1a2b3c4"}}
    ```
 
-5. Para publicar una versión, actualiza `<version>` en el `pom.xml` (por ejemplo `1.1.0`), fusiona el cambio y crea el tag:
+5. Verifica tú mismo la firma de la imagen publicada, sin instalar cosign (se ejecuta como contenedor). En el job **Publicar la imagen en GHCR** el resumen de la ejecución muestra el digest; si el paquete es privado, ejecuta antes `docker login ghcr.io`:
+
+   ```sh
+   export GITHUB_REPOSITORY=<tu-usuario>/DYAS-DevSecOps
+   scripts/verificar-firma.sh ghcr.io/<tu-usuario-en-minúsculas>/dyas-devsecops:sha-<commit>
+   ```
+
+   El script descarga la imagen, verifica la firma de su digest y termina con `==> Firma válida` y la referencia `...:sha-<commit>@sha256:...`. Cambia `GITHUB_REPOSITORY` por el repositorio de un compañero y vuelve a ejecutarlo: falla con `FIRMA NO VÁLIDA`, porque la imagen no la firmó **su** workflow.
+
+   Para revisar el SBOM que quedó adjunto a la imagen:
+
+   ```sh
+   docker run --rm ghcr.io/sigstore/cosign/cosign:v3.1.3 verify-attestation --type cyclonedx \
+     --certificate-identity-regexp "^https://github\.com/<tu-usuario>/DYAS-DevSecOps/" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+     ghcr.io/<tu-usuario-en-minúsculas>/dyas-devsecops:sha-<commit> > /dev/null && echo "SBOM firmado por el pipeline"
+   ```
+
+   > En un repositorio **privado** la imagen no se firma: el registro de transparencia de Sigstore (Rekor) es público
+   > y revelaría el nombre del repositorio. El paso de verificación lo indica en el resumen de la ejecución (H-08 de `docs/seguridad.md`).
+
+6. Para publicar una versión, actualiza `<version>` en el `pom.xml` (por ejemplo `1.1.0`), fusiona el cambio y crea el tag:
 
    ```sh
    git checkout main && git pull
@@ -690,9 +761,40 @@ El runner se instala en la máquina donde va a quedar desplegado el sistema.
 
 1. En la página del paquete (*Packages* → `dyas-devsecops`) identifica el tag de la versión anterior, por ejemplo `sha-1a2b3c4`.
 2. *Actions → CD → Run workflow*, escribe el tag y ejecuta.
-3. El job **Reversión manual** despliega esa imagen y ejecuta la prueba de humo. Comprueba con `/actuator/info` que volvió la versión anterior.
+3. El job **Reversión manual** verifica la firma de esa imagen, la despliega y ejecuta la prueba de humo. Comprueba con `/actuator/info` que volvió la versión anterior.
 
-### Paso 13: Apagar el sistema
+### Paso 13: Medir el desempeño con las métricas DORA
+
+1. *Actions → Métricas DORA → Run workflow*. El workflow también corre solo cada lunes.
+2. Abre la ejecución: el resumen muestra una tabla como esta (los valores dependen del historial de tu repositorio):
+
+   ```text
+   ## Métricas DORA de <tu-usuario>/DYAS-DevSecOps
+
+   Despliegues revisados: 3 (exitosos: 2, fallidos: 1). Job contado: "Desplegar y verificar".
+
+   | Métrica | Valor |
+   |---|---|
+   | Frecuencia de despliegue | 2 despliegues exitosos por semana |
+   | Tiempo de espera de los cambios (mediana) | 1 h |
+   | Tasa de fallos de los cambios | 33.3 % |
+   | Tiempo de restauración (mediana) | 2 días |
+   ```
+
+   El ejemplo tiene un despliegue fallido: el del ejercicio 5, que incumplió el SLO y se revirtió solo.
+
+3. Lee qué mide cada una en la sección 6 de [`docs/devops.md`](docs/devops.md). El cálculo lo hace [`scripts/metricas-dora.sh`](scripts/metricas-dora.sh) con la API de GitHub; en un repositorio público también funciona en tu máquina si tienes `curl` y `jq`:
+
+   ```sh
+   scripts/metricas-dora.sh <tu-usuario>/DYAS-DevSecOps
+   ```
+
+   Mientras la variable `DESPLIEGUE` no valga `activo` no hay despliegues que contar, y el script lo indica.
+
+> **Para discutir:** ¿qué métrica empeora si el equipo sube el umbral de cobertura y el pipeline tarda más? ¿Cuál mejora
+> si la prueba de carga detecta en el pipeline un problema que antes llegaba a producción?
+
+### Paso 14: Apagar el sistema
 
 En tu máquina:
 
@@ -818,11 +920,44 @@ Luego revierte con `scripts/rollback.sh reservas:v2` y vuelve a ejecutar `script
 
 En GitHub, si este cambio llega a `main`, el job **Desplegar y verificar** falla en *Prueba de carga del SLO* y el paso **Reversión automática** vuelve a la versión anterior. Después, revierte el commit con un Pull Request (`git revert`).
 
+### Ejercicio 6: Una imagen que no construyó el pipeline
+
+Este ejercicio necesita el runner registrado y un repositorio público. Simula que alguien con acceso al registro sube una imagen propia con una etiqueta que parece legítima:
+
+```sh
+docker login ghcr.io -u <tu-usuario>     # con un token personal con permiso write:packages
+docker build --build-arg VERSION=9.9.9 -t ghcr.io/<tu-usuario-en-minúsculas>/dyas-devsecops:sha-manual .
+docker push ghcr.io/<tu-usuario-en-minúsculas>/dyas-devsecops:sha-manual
+```
+
+Ahora pide la reversión manual a esa etiqueta: *Actions → CD → Run workflow* con el tag `sha-manual`. Falla el paso **Verificar la firma de la imagen** del job **Reversión manual** y la imagen no se despliega:
+
+```text
+FIRMA NO VÁLIDA: ghcr.io/<usuario>/dyas-devsecops:sha-manual no fue firmada por el workflow cd.yml de <usuario>/DYAS-DevSecOps. No se despliega.
+```
+
+La imagen es idéntica a una buena: el escaneo de Trivy la habría aprobado. Lo que la delata es que no la firmó el workflow. Al terminar, borra la versión `sha-manual` en la página del paquete (*Package settings → Manage versions*).
+
+### Ejercicio 7 (opcional): Un agente de código frente a las reglas del repositorio
+
+Si usas un asistente o agente de programación, pídele en una rama nueva:
+
+> Agrega una regla de negocio: el código de la sala debe existir en el catálogo de salas de la biblioteca. Consulta el catálogo con una petición HTTP desde la clase Reserva.
+
+1. Revisa qué propone. Si el agente leyó [`AGENTS.md`](AGENTS.md), debería poner la consulta detrás de un puerto (`CatalogoSalas` en `aplicacion.puertos.salida`) y un adaptador nuevo, no dentro del dominio.
+2. Repite el pedido con un agente o una sesión que no lea `AGENTS.md` (o borra el archivo en la rama) y compara.
+3. Abre el Pull Request con la versión que pone la consulta dentro de `Reserva` y revisa el job **Build, pruebas, cobertura y arquitectura**:
+   - Si usa un cliente HTTP de Spring (`RestClient`, `RestTemplate`), falla la regla `dominioNoDependeDeFrameworks`.
+   - Si usa `java.net.http.HttpClient`, **ninguna regla falla**: el dominio quedó acoplado a la red y el pipeline no lo ve, porque nadie escribió esa regla.
+4. En el segundo caso, agrega a `ArquitecturaTest` una regla que prohíba al dominio depender de `java.net..` y `java.sql..`, comprueba que ahora el Pull Request falla y cierra el Pull Request sin fusionar. La regla nueva sí se queda: llévala a `main` en otro Pull Request.
+
+Las instrucciones reducen los cambios que hay que rechazar; el pipeline garantiza que no llegue a `main` ninguno que viole una regla escrita (amenaza A9 de `docs/seguridad.md`). Lo que no está escrito como prueba depende de la revisión humana del Pull Request.
+
 ---
 
 ## Retos opcionales
 
-Estos retos corresponden a las **bonificaciones** del Proyecto 3 (no son obligatorias).
+Ninguno es obligatorio. Los tres primeros coinciden con las bonificaciones del proyecto del curso.
 
 1. **Kubernetes:** escribe los manifiestos (`Deployment`, `Service`, `ConfigMap`, `Secret`) con *probes* de *liveness* y *readiness* (`/actuator/health/liveness` y `/actuator/health/readiness`) y límites de recursos, despliégalos en kind o minikube y agrega una `NetworkPolicy` que solo permita a la aplicación hablar con PostgreSQL.
 2. **Observabilidad:** agrega `micrometer-registry-prometheus`, expón `/actuator/prometheus` y construye en Grafana un tablero con la latencia p95, la tasa de error y el *throughput*, con el umbral del SLO como referencia. Ver el taller de [Monitoreo](https://github.com/CesarAVegaF312/DYAS-Monitoreo).
@@ -835,6 +970,9 @@ Estos retos corresponden a las **bonificaciones** del Proyecto 3 (no son obligat
 4. **Dos entornos:** crea un environment `pruebas` (despliegue automático) y uno `produccion` con *Required reviewers*, y ejecuta la prueba de carga en `pruebas`.
 5. **Prueba de carga larga:** agrega un workflow con `workflow_dispatch` o `schedule` que ejecute `scripts/slo.sh` con `SLO_DURACION=10m`.
 6. **Imágenes fijadas por digest:** reemplaza las etiquetas de las imágenes base por su *digest* (`imagen@sha256:...`) y deja que Dependabot las actualice.
+7. **Firma en un repositorio privado:** genera un par de llaves con `cosign generate-key-pair`, guarda la llave privada y su clave en GitHub Secrets, firma con `--key` en el job `publicar` y verifica con la llave pública en `scripts/verificar-firma.sh`. Compara qué se gana y qué se pierde frente a la firma sin llaves (ADR-003).
+8. **Verificar el SBOM antes de desplegar:** agrega al job `desplegar` un `cosign verify-attestation --type cyclonedx` y un escaneo del SBOM con `trivy sbom`, que detecta vulnerabilidades publicadas después de construir la imagen sin volver a escanearla.
+9. **Métricas DORA en el tiempo:** después de varias semanas de despliegues, compara dos ejecuciones de `dora.yml` y explica qué cambio del equipo o del pipeline movió cada métrica.
 
 ---
 
@@ -850,6 +988,9 @@ Estos retos corresponden a las **bonificaciones** del Proyecto 3 (no son obligat
 8. **Secretos fuera del código:** en GitHub Secrets o en un `.env` local que nunca se sube. Un secreto filtrado se rota.
 9. **Verificar después de desplegar:** un despliegue no termina cuando el contenedor arranca, sino cuando pasan la prueba de humo y el SLO.
 10. **Reversión probada antes de necesitarla:** el procedimiento se ensaya en local y en GitHub, no durante un incidente.
+11. **Desplegar solo lo que firmó el pipeline:** se firma el digest, se verifica la identidad del workflow antes de desplegar y se despliega por digest.
+12. **Saber qué hay dentro de cada versión:** cada imagen publicada tiene su SBOM, como artefacto y adjunto a la imagen.
+13. **Instrucciones para agentes en el repositorio:** `AGENTS.md` dice qué reglas no se negocian; el pipeline las hace cumplir. Toda regla que importe se escribe como prueba.
 
 ---
 
@@ -874,6 +1015,7 @@ Estructura mínima sugerida del Wiki:
 - **Controles de seguridad:** los cuatro Pull Requests bloqueados (ejercicios 1 a 4) con el log del job que falló.
 - **Despliegue:** el runner registrado, el environment `produccion` (sin mostrar los valores de los secretos) y una ejecución de CD en verde.
 - **Reversión:** evidencia de una reversión (automática por el ejercicio 5 o manual con *Run workflow*).
+- **(Opcional) Cadena de suministro y desempeño:** la verificación de la firma (paso 11), el ejercicio 6 y una ejecución de `dora.yml` con su interpretación. No suma puntos en la rúbrica; sirve como evidencia para el proyecto.
 - **Reflexión final.**
 
 ### 3) Pipeline de CI
@@ -908,6 +1050,7 @@ Estructura mínima sugerida del Wiki:
 - ¿Por qué el umbral de la imagen es menos estricto que el de las dependencias? ¿Lo endurecerían en su proyecto?
 - ¿Qué riesgo introduce el runner autohospedado y cómo lo mitigaron?
 - ¿Qué tendrían que cambiar para pasar de despliegue continuo a entrega continua?
+- ¿Qué ataque evita la verificación de la firma que no evita el escaneo de la imagen?
 
 ### 9) Rúbrica – Taller de DevSecOps y Despliegue Continuo
 
@@ -920,7 +1063,7 @@ Estructura mínima sugerida del Wiki:
 | **Despliegue continuo** | Imagen versionada, runner, secretos y prueba de humo. | Imagen con versión y SHA en GHCR, despliegue automático en el runner con secretos del environment y prueba de humo en verde. | Despliegue automático sin prueba de humo o sin tag de versión. | Imagen publicada pero despliegue manual. | Despliegue que nunca terminó en verde. | No hay despliegue. |
 | **Reversión** | Procedimiento de reversión probado. | Reversión ejecutada (automática o manual) con la prueba de humo de la versión anterior en verde. | Reversión ejecutada sin verificar la versión resultante. | Reversión solo probada en local. | Procedimiento descrito pero no probado. | No realiza el ejercicio. |
 | **Documentación en Wiki** | Secciones completas con evidencias y explicación del pipeline. | Wiki completo, claro y con evidencias de cada sección. | Wiki completo con leves omisiones. | Wiki incompleto o con poca claridad. | Wiki muy limitado o confuso. | No hay Wiki o está vacío. |
-| **Reflexión técnica** | Análisis de resultados y aprendizajes. | Reflexión profunda, conectada con el Proyecto 3. | Reflexión correcta pero superficial. | Reflexión breve o poco argumentada. | Reflexión vaga o sin relación con el taller. | No presenta reflexión. |
+| **Reflexión técnica** | Análisis de resultados y aprendizajes. | Reflexión profunda, conectada con el proyecto del curso. | Reflexión correcta pero superficial. | Reflexión breve o poco argumentada. | Reflexión vaga o sin relación con el taller. | No presenta reflexión. |
 
 > **Cómo suma**: 8 criterios × 5 pts = **40 puntos**.
 
@@ -959,6 +1102,13 @@ La guía sigue el orden de las secciones del enunciado del Proyecto 3:
 
 4. **DevSecOps (sección 4):** haz el modelo STRIDE de **tu** sistema (al menos cinco amenazas que nombren tus componentes) siguiendo [`docs/seguridad.md`](docs/seguridad.md). Copia los scripts de `scripts/` (`sca.sh`, `escaneo-imagen.sh`, `secretos.sh`, `umbral-sast.sh`) y los jobs correspondientes; en otros lenguajes cambia la parte de Maven (`npm ci`, `pip install`) y CodeQL detecta el lenguaje en `languages`. Registra cada hallazgo como corregido, falso positivo o riesgo aceptado, y deja un Pull Request bloqueado como evidencia.
 5. **Despliegue continuo (sección 5):** copia `cd.yml` y los scripts `deploy.sh`, `smoke-test.sh`, `slo.sh` y `rollback.sh`. Adapta la prueba de humo al flujo principal de tu sistema. Si despliegas en la nube en lugar de un runner autohospedado, conserva la publicación en GHCR, la prueba de humo y la reversión, y documenta la decisión en un ADR como [`ADR-002`](docs/adr/ADR-002-estrategia-de-despliegue.md).
+
+6. **Más allá del enunciado (opcional):** el enunciado no exige estas prácticas, pero cuestan poco una vez que el pipeline existe y muestran criterio de arquitectura en la presentación final:
+   - Copia `scripts/sbom.sh`, `scripts/verificar-firma.sh` y los pasos de SBOM y firma de `cd.yml` si tu repositorio es público.
+   - Agrega un `AGENTS.md` con las reglas de **tu** ADR y los comandos de verificación de **tu** proyecto.
+   - Agrega a `docs/seguridad.md` el inventario de datos personales de tu sistema (sección 3 del ejemplo): qué datos guarda, dónde y si salen hacia otro servicio.
+   - Copia `dora.yml` y `scripts/metricas-dora.sh`, y reporta las cuatro métricas en `docs/devops.md`.
+   - Los retos opcionales 1 a 3 corresponden a las bonificaciones del enunciado (Kubernetes, observabilidad y DAST).
 
 Checklist para el Proyecto 3:
 
@@ -1006,6 +1156,17 @@ Checklist para el Proyecto 3:
 - **Cómo:** volver a desplegar la imagen anterior (`scripts/rollback.sh` o *Run workflow* con el tag).
 - **Por qué funciona:** las imágenes no cambian y los datos viven en un volumen aparte.
 
+### Cadena de suministro
+
+- **SBOM:** inventario de los componentes de cada imagen publicada, en formato CycloneDX.
+- **Firma sin llaves:** el pipeline firma el digest con la identidad de `cd.yml`; el despliegue verifica esa identidad y despliega por digest.
+- **Agentes de código:** `AGENTS.md` orienta el cambio antes de escribirlo; el pipeline lo verifica después.
+
+### Métricas DORA
+
+- **Qué miden:** frecuencia de despliegue, tiempo de espera de los cambios, tasa de fallos y tiempo de restauración.
+- **De dónde salen:** del historial de ejecuciones de `cd.yml`, con `dora.yml`.
+
 ---
 
 ## Conclusión
@@ -1016,6 +1177,8 @@ En conjunto, estas prácticas permiten:
 - Conservar las decisiones de arquitectura cambio a cambio (**funciones de aptitud**).
 - Saber exactamente qué versión está desplegada y volver a la anterior en minutos (**imágenes inmutables y reversión**).
 - Desplegar sin pasos manuales y con evidencia de que la versión nueva funciona y cumple el SLO (**despliegue continuo**).
+- Desplegar solo imágenes que construyó y firmó el propio pipeline, y saber qué componentes tiene cada una (**cadena de suministro**).
+- Medir con datos del pipeline si el equipo entrega más rápido y con menos fallos (**métricas DORA**).
 
 Con esto se logra un proceso en el que cada cambio que llega a `main` demostró que conserva los atributos de calidad del sistema y que no introduce vulnerabilidades conocidas.
 
@@ -1042,6 +1205,13 @@ Con esto se logra un proceso en el que cada cambio que llega a `main` demostró 
 - Spring Security – [Cross Site Request Forgery (CSRF)](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html)
 - OWASP ZAP – [Baseline Scan](https://www.zaproxy.org/docs/docker/baseline-scan/)
 - Google SRE Book – [Service Level Objectives](https://sre.google/sre-book/service-level-objectives/)
+- Sigstore – [Signing containers](https://docs.sigstore.dev/cosign/signing/signing_with_containers/) y [Verifying signatures](https://docs.sigstore.dev/cosign/verifying/verify/)
+- GitHub – [sigstore/cosign-installer](https://github.com/sigstore/cosign-installer)
+- CycloneDX – [Specification overview](https://cyclonedx.org/specification/overview/)
+- SLSA – [Supply-chain Levels for Software Artifacts](https://slsa.dev/)
+- NIST – [SP 800-207: Zero Trust Architecture](https://csrc.nist.gov/pubs/sp/800/207/final)
+- DORA – [DORA's software delivery metrics: the four keys](https://dora.dev/guides/dora-metrics-four-keys/)
+- AGENTS.md – [Formato abierto de instrucciones para agentes de código](https://agents.md/)
 
 ---
 

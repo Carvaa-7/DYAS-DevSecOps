@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TRIVY_IMAGEN="${TRIVY_IMAGEN:-aquasec/trivy:0.75.0}"
+TRIVY_IMAGEN="${TRIVY_IMAGEN:-aquasec/trivy:0.76.0}"
 
 # Trivy lee el pom.xml y resuelve las dependencias transitivas. Se le pasa la caché local de Maven
 # para que no tenga que descargar los pom de Maven Central (que limita las peticiones repetidas).

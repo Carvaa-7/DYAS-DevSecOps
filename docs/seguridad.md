@@ -1,6 +1,6 @@
 # Seguridad del servicio de reservas
 
-Este documento tiene tres partes: el modelo de amenazas (STRIDE), los controles de seguridad del pipeline con sus umbrales y el registro de hallazgos.
+Este documento tiene cuatro partes: el modelo de amenazas (STRIDE), el inventario de los datos personales que maneja el sistema, los controles de seguridad del pipeline con sus umbrales y el registro de hallazgos.
 
 ## 1. Componentes y flujos analizados
 
@@ -12,14 +12,22 @@ flowchart LR
         db[("postgres<br/>127.0.0.1:5433")]
         runner["Runner autohospedado<br/>(etiqueta dyas)"]
     end
+    dev["Integrante o agente de código"]
+    repo["Repositorio en GitHub<br/>(main protegida)"]
     gh["GitHub Actions"]
     ghcr["GHCR<br/>ghcr.io/&lt;usuario&gt;/&lt;repo&gt;"]
+    sigstore["Sigstore<br/>(certificados y registro Rekor)"]
 
     cliente -- "F1: HTTPS/HTTP + Basic" --> app
     app -- "F2: JDBC" --> db
     gh -- "F3: trabajos del pipeline" --> runner
     runner -- "F4: docker pull" --> ghcr
     runner -- "F5: docker compose up" --> app
+    dev -- "F6: Pull Request" --> repo
+    repo --> gh
+    gh -- "F7: push, firma y SBOM" --> ghcr
+    gh -- "F7: certificado de firma" --> sigstore
+    runner -- "F8: verificación de la firma" --> sigstore
 ```
 
 ## 2. Modelo de amenazas (STRIDE)
@@ -28,16 +36,30 @@ flowchart LR
 |---|---|---|---|---|---|
 | A1 | Suplantación (S) | F1, `app` | Alguien sin credenciales crea o cancela reservas, o se hace pasar por un gestor. | Autenticación HTTP Basic en toda la API; claves de al menos 12 caracteres que llegan por variables de entorno desde GitHub Secrets; el autor de la reserva se toma del usuario autenticado (`registradaPor`), no del cuerpo de la petición. | `ReservaControllerTest` (`sinCredencialesRespondeNoAutorizado`, `conUnaClaveIncorrectaRespondeNoAutorizado`); paso 3 de `scripts/smoke-test.sh` (espera 401 en cada despliegue). |
 | A2 | Manipulación (T) | F1 → F2 | Datos de entrada manipulados: inyección SQL, horarios fuera de rango, cuerpos incompletos. | Consultas de Spring Data con parámetros (sin concatenar SQL); validación de formato con Bean Validation; reglas de negocio en el dominio; la API solo acepta `application/json`. | SAST con CodeQL (job `sast`); `ReservaTest`; `rechazaUnCuerpoIncompletoSinLlamarAlCasoDeUso`; `soloAceptaJson`. |
-| A3 | Manipulación (T) | F4, imagen | Se despliega una imagen alterada o con una dependencia vulnerable (cadena de suministro). | Imágenes base con versión fija; Trivy sobre dependencias e imagen; Dependabot; se despliega la etiqueta `sha-...` de la imagen que se escaneó; herramientas de seguridad con versión fija. | Jobs `sca` e `imagen`; paso *Quality gate de la imagen* del job `publicar`. |
+| A3 | Manipulación (T) | F4, F7, imagen | Se despliega una imagen alterada, una imagen que no construyó el pipeline (por ejemplo, subida a mano al registro con una credencial filtrada) o una imagen con una dependencia vulnerable (cadena de suministro). | Imágenes base con versión fija; Trivy sobre dependencias e imagen; Dependabot; herramientas de seguridad con versión fija. El job `publicar` firma el digest de la imagen con la identidad de `cd.yml` (firma sin llaves de Sigstore) y le adjunta su SBOM; `desplegar` y `revertir` verifican la firma y despliegan por digest, así que una imagen sin firma, firmada por otro workflow o con la etiqueta movida no se despliega. | Jobs `sca` e `imagen`; paso *Quality gate de la imagen* de `publicar`; paso *Verificar la firma de la imagen* de `desplegar` y `revertir` (`scripts/verificar-firma.sh`). |
 | A4 | Repudio (R) | `app` | Un gestor niega haber creado o cancelado una reserva. | Cada reserva guarda quién la registró (`registradaPor`); el registro `auditoria` escribe acción, reserva y usuario en cada creación y cancelación. | `elGestorCreaUnaReservaYQuedaRegistradoComoAutor`; `creaGuardaEnPostgresYConsultaUnaReserva` (`ReservasApiIT`). Límite: los logs viven en el contenedor (ver H-06). |
 | A5 | Divulgación de información (I) | repositorio, imagen, F1 | Una contraseña o token queda en el código, en el historial o en la imagen; un error muestra la traza de la pila; Actuator expone variables de entorno. | Gitleaks sobre todo el historial; `.env` en `.gitignore` y en `.dockerignore`; configuración solo por variables de entorno; `server.error.include-stacktrace=never`; Actuator solo expone `health` e `info`; consultar reservas (que tienen correos) exige autenticación. | Job `secretos`; `lasRutasNoDeclaradasQuedanBloqueadas` (`/actuator/env` responde 403). |
 | A6 | Denegación de servicio (D) | `app`, `postgres` | Un pico de peticiones o una consulta lenta deja el servicio sin responder. | Límites de CPU y memoria en `docker-compose.yml`; la consulta de reservas es de un solo día y usa índice; el SLO se verifica con carga en cada despliegue; reinicio automático (`restart: unless-stopped`). | `scripts/slo.sh` (k6, p95 < 500 ms, errores < 1 %) en el job `desplegar`. Límite: no hay limitación de tasa por cliente (ver H-07). |
 | A7 | Elevación de privilegios (E) | `app`, runner | (a) Un atacante que logra ejecutar código en la aplicación toma control del contenedor o de la máquina. (b) Un Pull Request de un repositorio externo (fork) ejecuta código en el runner autohospedado. (c) Un usuario de consulta intenta crear reservas. | (a) Usuario sin privilegios (UID 10001), `cap_drop: ALL`, `no-new-privileges`, sistema de archivos de solo lectura. (b) Los Pull Requests corren en runners de GitHub; el runner solo atiende jobs de `main`, tags y la reversión manual dentro del environment `produccion`; en repositorios públicos se exige aprobación para workflows de colaboradores externos. (c) Autorización por roles (CONSULTA no puede escribir). | `docker compose exec app id` (uid=10001); `elRolConsultaPuedeListarPeroNoCrear` (403); en `cd.yml` solo los jobs `desplegar` y `revertir` usan `self-hosted`, y `cd.yml` no se dispara con `pull_request`. |
 | A8 | Divulgación de información (I) | F2, `postgres` | La base de datos queda expuesta en la red. | El puerto de PostgreSQL solo se publica en `127.0.0.1`; la aplicación se conecta por la red interna de Compose. | `docker compose ps` muestra `127.0.0.1:5433->5432/tcp`. |
+| A9 | Manipulación (T) | F6, repositorio | Un cambio generado por un asistente o agente de código rompe una frontera de la arquitectura, baja un umbral, registra una excepción sin justificar o agrega una dependencia que no existe o suplanta a una conocida (paquete con un nombre parecido al que el modelo "recordó"). | `AGENTS.md` con las reglas de arquitectura y de seguridad del repositorio (control antes del cambio); `main` protegida con Pull Request, una aprobación humana y todos los checks obligatorios (control después del cambio); ArchUnit, SCA y Gitleaks no distinguen quién escribió el código. | Ejercicio 7 del README; ruleset `proteger-main`; jobs `build-pruebas`, `sca` y `secretos`. |
 
-## 3. Controles del pipeline
+## 3. Inventario de datos personales
 
-Los cuatro controles funcionan como *quality gates*: si encuentran un problema por encima del umbral, el job falla y el Pull Request no se puede fusionar. Se pueden ejecutar en local con los mismos scripts que usa el pipeline.
+El inventario responde qué datos de personas maneja el sistema, dónde quedan y si salen de él. Es la base para decidir qué proteger y qué no guardar.
+
+| Dato | Para qué se usa | Dónde queda | Quién lo puede leer | ¿Sale del sistema? | Retención |
+|---|---|---|---|---|---|
+| Correo institucional del responsable de la reserva | Identificar a quién se le asignó la sala | Tabla `reservas` en PostgreSQL | Usuarios GESTOR y CONSULTA de la API (exige autenticación) | No | Mientras exista la reserva. No hay borrado automático (ver H-09). |
+| Usuario que registró o canceló la reserva (`registradaPor`) | Auditoría (A4) | Tabla `reservas` y logs del contenedor (`auditoria`) | GESTOR y CONSULTA; quien administra la máquina (logs) | No | Base de datos: mientras exista la reserva. Logs: hasta que se recrea el contenedor (H-06). |
+| Claves de los usuarios de la API | Autenticación | GitHub Secrets (environment `produccion`) o `.env` local; en la aplicación, solo el hash BCrypt en memoria | Administradores del repositorio (no pueden volver a leer el valor en GitHub) | No | Hasta que se rotan. |
+| Datos de las pruebas | Prueba de humo y prueba de carga | La base de datos desplegada (las reservas de prueba se cancelan) y los reportes de k6 | Integrantes del equipo | Los reportes se publican como artefactos de GitHub Actions; no contienen correos reales | 90 días (retención por defecto de los artefactos). |
+
+Lo que el sistema **no** hace, a propósito: no guarda la dirección IP de los clientes, no envía datos a servicios de analítica ni a modelos de lenguaje, y los mensajes de error no devuelven datos de otras reservas. Si un cambio futuro envía datos a un servicio externo (por ejemplo, un asistente con un modelo de lenguaje), primero se agrega una fila a esta tabla y una amenaza al modelo STRIDE.
+
+## 4. Controles del pipeline
+
+Los cuatro controles de análisis funcionan como *quality gates*: si encuentran un problema por encima del umbral, el job falla y el Pull Request no se puede fusionar. Se pueden ejecutar en local con los mismos scripts que usa el pipeline. La verificación de la firma es un quality gate del despliegue: si falla, la imagen no se despliega.
 
 | Control | Herramienta | Script / job | Umbral mínimo | Umbral de este repositorio |
 |---|---|---|---|---|
@@ -45,6 +67,8 @@ Los cuatro controles funcionan como *quality gates*: si encuentran un problema p
 | Análisis de dependencias (SCA) | Trivy `fs` + Dependabot | `scripts/sca.sh` / `sca` | Ninguna vulnerabilidad alta o crítica con corrección | HIGH o CRITICAL con corrección (`--severity HIGH,CRITICAL --ignore-unfixed`) |
 | Detección de secretos | Gitleaks | `scripts/secretos.sh` / `secretos` | Cero secretos, incluido el historial | Cero secretos en todos los commits (`gitleaks git`) |
 | Escaneo de la imagen | Trivy `image` | `scripts/escaneo-imagen.sh` / `imagen` y `publicar` | Ninguna vulnerabilidad crítica con corrección | CRITICAL con corrección (`--severity CRITICAL --ignore-unfixed`) |
+| Firma de la imagen (cadena de suministro) | cosign 3.1.3 (Sigstore, firma sin llaves) | `publicar` firma; `scripts/verificar-firma.sh` / `desplegar` y `revertir` verifican | No lo exige el enunciado | No se despliega una imagen sin una firma de `cd.yml` de este repositorio, desde `main` o desde un tag `vX.Y.Z` |
+| SBOM | Trivy (CycloneDX) | `scripts/sbom.sh` / `imagen` y `publicar` | No lo exige el enunciado | No detiene el pipeline: se publica como artefacto y se adjunta a la imagen como atestación |
 
 Cómo se registra una excepción:
 
@@ -54,7 +78,7 @@ Cómo se registra una excepción:
 
 Toda excepción debe aparecer en la tabla siguiente. Una excepción sin registro, o un umbral relajado, cuenta como un control no implementado.
 
-## 4. Registro de hallazgos
+## 5. Registro de hallazgos
 
 | ID | Control | Hallazgo | Decisión | Justificación o corrección |
 |---|---|---|---|---|
@@ -65,8 +89,10 @@ Toda excepción debe aparecer en la tabla siguiente. Una excepción sin registro
 | H-05 | Imagen (Trivy) | Vulnerabilidades MEDIUM y LOW en paquetes de Ubuntu 24.04 de la imagen base `eclipse-temurin`, sin corrección publicada. | Riesgo aceptado | Están por debajo del umbral y no tienen corrección disponible. Dependabot propone las nuevas versiones de la imagen base; el reporte completo queda en el artefacto `reporte-imagen`. |
 | H-06 | Modelo de amenazas (A4) | El registro de auditoría vive en los logs del contenedor y se pierde al recrearlo. | Riesgo aceptado | Para un sistema académico de un solo servidor es suficiente con `docker compose logs`. **Para corregirlo:** centralizar los logs (Loki o ELK) o guardar la cancelación y su autor en la base de datos. |
 | H-07 | Modelo de amenazas (A6) | No hay limitación de tasa por cliente. | Riesgo aceptado | El servicio no está expuesto a Internet en el entorno del equipo. **Para corregirlo:** un proxy inverso (Traefik o Nginx) con *rate limiting* delante de la aplicación. |
+| H-08 | Firma de la imagen (A3) | En un repositorio **privado** la imagen no se firma ni se verifica antes de desplegar. | Riesgo aceptado | La firma sin llaves queda registrada en Rekor, que es público, y ese registro incluiría el nombre del repositorio privado. En un repositorio privado el riesgo de A3 lo reducen el escaneo de la imagen, el despliegue de la etiqueta `sha-...` y que solo el `GITHUB_TOKEN` del job `publicar` puede escribir en el registro. **Para corregirlo:** firmar con un par de llaves propio (`cosign generate-key-pair`, la llave privada en GitHub Secrets) o con las atestaciones de artefactos de GitHub. |
+| H-09 | Inventario de datos (sección 3) | Las reservas, con el correo del responsable, no se borran nunca. | Riesgo aceptado | El volumen de datos es pequeño y el historial sirve para estadísticas de uso de las salas. **Para corregirlo:** definir con la biblioteca un plazo de retención y una tarea programada que anonimice el correo de las reservas más antiguas. |
 
-## 5. Evidencia de que los controles funcionan
+## 6. Evidencia de que los controles funcionan
 
 Cada control se probó con un cambio que introduce el problema a propósito. En el repositorio del proyecto, cada uno de estos cambios se hace en una rama y se abre un Pull Request que el pipeline bloquea y que **no se fusiona**. El paso a paso está en la sección *Demostrar que los controles funcionan* del README.
 
@@ -76,3 +102,4 @@ Cada control se probó con un cambio que introduce el problema a propósito. En 
 | Secretos | Agregar una llave inventada a `application.properties` | Gitleaks reporta `generic-api-key`; falla `secretos`, también después de borrar la línea en otro commit |
 | SAST | Borrar la línea de H-01 en `.github/codeql/excepciones-sast.txt` | `[PENDIENTE] 8.8 java/spring-disabled-csrf-protection`; falla `sast` |
 | Arquitectura | Usar `org.springframework.util.StringUtils` dentro de `Reserva` | ArchUnit reporta la violación de la regla 2; falla `build-pruebas` |
+| Firma de la imagen | Subir a mano una imagen al registro y pedir la reversión manual a esa etiqueta | `FIRMA NO VÁLIDA`; falla el paso *Verificar la firma de la imagen* de `revertir` y la imagen no se despliega |
