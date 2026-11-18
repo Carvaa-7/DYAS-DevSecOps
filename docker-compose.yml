@@ -64,7 +64,7 @@ services:
 
   # Prueba de carga corta con los umbrales del SLO (perf/slo.js). Se ejecuta con scripts/slo.sh.
   k6:
-    image: grafana/k6:2.3.0
+    image: grafana/k6:2.4.0
     profiles: ["pruebas"]
     volumes:
       - ./perf:/perf:ro
